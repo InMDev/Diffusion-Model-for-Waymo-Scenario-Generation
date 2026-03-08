@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
@@ -21,6 +22,23 @@ def save_figure(fig: plt.Figure, stem: str, dpi: int = 300) -> None:
     fig.savefig(png_path, dpi=dpi, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
     print(f"Saved figure: {png_path} and {pdf_path}")
+
+
+def save_animation_gif(
+    anim: animation.FuncAnimation,
+    stem: str,
+    fps: int = 10,
+    dpi: int = 120,
+) -> Path:
+    """Save a Matplotlib animation as GIF under `./figures` and return its path."""
+    gif_path = PAPER_FIG_DIR / f"{stem}.gif"
+    try:
+        writer = animation.PillowWriter(fps=fps)
+    except Exception as exc:
+        raise RuntimeError("GIF export requires Pillow (pip install pillow).") from exc
+    anim.save(str(gif_path), writer=writer, dpi=dpi)
+    print(f"Saved GIF: {gif_path}")
+    return gif_path
 
 
 def _future_window(current_idx: int, total_steps: int, horizon: int = FUTURE_STEPS) -> tuple[int, int]:

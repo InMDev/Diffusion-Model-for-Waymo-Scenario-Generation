@@ -44,12 +44,5 @@ waymo_batch_temp/
 *.tfrecord.*
 *.gstmp
 
-# Model checkpoints and weights
-checkpoints/
-chunk_diffusion_pytorch_only.pt
-*.pt
-*.pth
-*.ckpt
-
 # Windows alternate stream artifacts
 *:Zone.Identifier
