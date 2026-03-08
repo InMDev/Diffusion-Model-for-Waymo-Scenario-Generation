@@ -2,12 +2,12 @@
 
 <div align="center">
 
-| Scenario 9 | Scenario 26 | Scenario 10 |
-| :---: | :---: | :---: |
-| <img src="figures/Scenario 9/fig0_rollout_animation.gif" width="100%" /> | <img src="figures/Scenario 26/fig0_rollout_animation.gif" width="100%" /> | <img src="figures/Scenario 10/fig0_rollout_animation.gif" width="100%" /> |
+| Scenario 9 | Scenario 26 |
+| :---: | :---: |
+| <img src="figures/Scenario 9/fig0_rollout_animation.gif" width="100%" /> | <img src="figures/Scenario 26/fig0_rollout_animation.gif" width="100%" /> |
 
 </div>
-This project builds a **Waymo Motion Scenario-Gen training pipeline** from raw TFRecords to cached PyTorch shards, trains a **chunked diffusion trajectory model**, and runs inference with post-processing plus report-ready visualizations.
+This project builds a **Waymo Motion Scenario-Gen training pipeline** from raw TFRecords to cached PyTorch shards, trains a diffusion trajectory model, and runs inference with post-processing plus report-ready visualizations.
 
 ## Project Goal
 Predict 80 future timesteps of agent motion (x, y) using structured scene context:
