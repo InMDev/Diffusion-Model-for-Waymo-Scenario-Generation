@@ -1,0 +1,55 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool caches / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*~
+
+# Logs and temp files
+logs/
+*.log
+*.tmp
+*.temp
+*.swp
+
+# Waymo data caches and TFRecord artifacts
+waymo_cache_v2/
+waymo_cache_v2-old/
+waymo_val_cache/
+waymo_eda_data/
+waymo_batch_temp/
+*.tfrecord
+*.tfrecord.*
+*.gstmp
+
+# Model checkpoints and weights
+checkpoints/
+chunk_diffusion_pytorch_only.pt
+*.pt
+*.pth
+*.ckpt
+
+# Windows alternate stream artifacts
+*:Zone.Identifier
