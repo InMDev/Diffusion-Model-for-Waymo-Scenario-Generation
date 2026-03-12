@@ -207,6 +207,9 @@ class ConditionEncoder(nn.Module):
         nbr_emb = self.nbr_mlp(cond["nbr"])
         nbr_valid = cond["masks"]["nbr_valid"]
         key_padding_mask = ~nbr_valid.bool()
+        # When all neighbors are invalid, unmask them to avoid NaN from
+        # softmax over a fully-masked sequence; the zero-valued embeddings
+        # will produce a near-zero output representing "no neighbor info".
         all_invalid = key_padding_mask.all(dim=1)
         if all_invalid.any():
             key_padding_mask = key_padding_mask.clone()
@@ -230,6 +233,8 @@ class AdaLNTransformerBlock(nn.Module):
         super().__init__()
         if dim_feedforward is None:
             dim_feedforward = d_model * 2
+        # elementwise_affine=False: AdaLN replaces learned affine params
+        # with adaptive scale/shift derived from the conditioning signal.
         self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -238,6 +243,8 @@ class AdaLNTransformerBlock(nn.Module):
             nn.GELU(),
             nn.Linear(dim_feedforward, d_model),
         )
+        # Produces (shift1, scale1, gate1, shift2, scale2, gate2) for the
+        # two sub-layer norms (attention and FFN).
         self.adaLN_modulation = nn.Sequential(
             nn.GELU(),
             nn.Linear(d_model, 6 * d_model),
