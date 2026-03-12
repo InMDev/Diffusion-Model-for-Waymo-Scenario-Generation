@@ -166,12 +166,17 @@ class ConditionEncoder(nn.Module):
             nn.Linear(128, 128),
             nn.GELU(),
         )
+        self.hist_gru = nn.GRU(128, 128, batch_first=True)
+
         self.nbr_mlp = nn.Sequential(
             nn.Linear(NBR_DIM, 96),
             nn.GELU(),
             nn.Linear(96, 96),
             nn.GELU(),
         )
+        self.nbr_query = nn.Parameter(torch.randn(1, 1, 96) * 0.02)
+        self.nbr_attn = nn.MultiheadAttention(96, num_heads=4, batch_first=True)
+
         self.map_mlp = nn.Sequential(
             nn.Linear(MAP_DIM, 32),
             nn.GELU(),
@@ -190,22 +195,120 @@ class ConditionEncoder(nn.Module):
             nn.Linear(cond_dim, cond_dim),
         )
 
-    def _masked_pool(self, x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        m = m.unsqueeze(-1)
-        denom = m.sum(dim=1).clamp_min(1.0)
-        return (x * m).sum(dim=1) / denom
-
     def forward(self, cond: dict) -> torch.Tensor:
+        # History: GRU for temporal encoding
         hist_emb = self.hist_mlp(cond["hist"])
-        hist_pool = self._masked_pool(hist_emb, cond["masks"]["hist_valid"])
+        hist_mask = cond["masks"]["hist_valid"].unsqueeze(-1)
+        hist_emb = hist_emb * hist_mask
+        _, hist_hidden = self.hist_gru(hist_emb)
+        hist_pool = hist_hidden.squeeze(0)
 
+        # Neighbors: Multi-Head Attention for social encoding
         nbr_emb = self.nbr_mlp(cond["nbr"])
-        nbr_pool = self._masked_pool(nbr_emb, cond["masks"]["nbr_valid"])
+        nbr_valid = cond["masks"]["nbr_valid"]
+        key_padding_mask = ~nbr_valid.bool()
+        all_invalid = key_padding_mask.all(dim=1)
+        if all_invalid.any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_invalid] = False
+        query = self.nbr_query.expand(nbr_emb.shape[0], -1, -1)
+        nbr_pool, _ = self.nbr_attn(
+            query, nbr_emb, nbr_emb, key_padding_mask=key_padding_mask,
+        )
+        nbr_pool = nbr_pool.squeeze(1)
 
         map_emb = self.map_mlp(cond["map"])
         static_emb = self.static_mlp(cond["static"])
 
         return self.out_proj(torch.cat([hist_pool, nbr_pool, map_emb, static_emb], dim=-1))
+
+
+class AdaLNTransformerBlock(nn.Module):
+    """Transformer block with Adaptive Layer Norm (AdaLN) conditioning."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int | None = None):
+        super().__init__()
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 2
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(d_model, 6 * d_model),
+        )
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        mod = self.adaLN_modulation(c).unsqueeze(1)
+        shift1, scale1, gate1, shift2, scale2, gate2 = mod.chunk(6, dim=-1)
+
+        h = self.norm1(x) * (1 + scale1) + shift1
+        h = self.attn(h, h, h)[0]
+        x = x + gate1 * h
+
+        h = self.norm2(x) * (1 + scale2) + shift2
+        h = self.ffn(h)
+        x = x + gate2 * h
+
+        return x
+
+
+class TransformerBackbone(nn.Module):
+    """Sequential Transformer backbone for noise prediction."""
+
+    def __init__(
+        self,
+        target_dim: int = TARGET_DIM,
+        cond_dim: int = COND_DIM,
+        time_dim: int = 128,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_layers: int = 4,
+    ):
+        super().__init__()
+        self.future_steps = target_dim // 4
+        self.d_model = d_model
+
+        self.input_proj = nn.Linear(4, d_model)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.future_steps, d_model) * 0.02,
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim + time_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.blocks = nn.ModuleList(
+            [AdaLNTransformerBlock(d_model, nhead) for _ in range(num_layers)],
+        )
+        self.final_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, 4)
+
+    def forward(
+        self,
+        x_noisy: torch.Tensor,
+        cond_emb: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        b = x_noisy.shape[0]
+        x = x_noisy.view(b, self.future_steps, 4)
+        x = self.input_proj(x) + self.pos_embed
+
+        c = self.cond_proj(torch.cat([cond_emb, t_emb], dim=-1))
+
+        for block in self.blocks:
+            x = block(x, c)
+
+        x = self.final_norm(x)
+        x = self.output_proj(x)
+        return x.reshape(b, -1)
 
 
 class ChunkDiffusionModel(nn.Module):
@@ -224,12 +327,10 @@ class ChunkDiffusionModel(nn.Module):
             nn.Linear(128, 128),
             nn.GELU(),
         )
-        self.net = nn.Sequential(
-            nn.Linear(target_dim + cond_dim + 128, 512),
-            nn.GELU(),
-            nn.Linear(512, 512),
-            nn.GELU(),
-            nn.Linear(512, target_dim),
+        self.net = TransformerBackbone(
+            target_dim=target_dim,
+            cond_dim=cond_dim,
+            time_dim=128,
         )
         self.pos_head = nn.Linear(cond_dim, pos_vocab_size) if pos_vocab_size > 0 else None
         self.traj_head = nn.Linear(cond_dim, traj_vocab_size) if traj_vocab_size > 0 else None
@@ -245,7 +346,7 @@ class ChunkDiffusionModel(nn.Module):
     def forward(self, x_noisy: torch.Tensor, t_norm: torch.Tensor, cond: dict) -> torch.Tensor:
         cond_emb = self.encoder(cond)
         t_emb = self.time_mlp(t_norm)
-        return self.net(torch.cat([x_noisy, cond_emb, t_emb], dim=-1))
+        return self.net(x_noisy, cond_emb, t_emb)
 
     def forward_with_aux(
         self,
@@ -255,7 +356,7 @@ class ChunkDiffusionModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
         cond_emb = self.encoder(cond)
         t_emb = self.time_mlp(t_norm)
-        pred_noise = self.net(torch.cat([x_noisy, cond_emb, t_emb], dim=-1))
+        pred_noise = self.net(x_noisy, cond_emb, t_emb)
         pos_logits, traj_logits = self.predict_token_logits(cond_emb)
         return pred_noise, pos_logits, traj_logits, cond_emb
 
