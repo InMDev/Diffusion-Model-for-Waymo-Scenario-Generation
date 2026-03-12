@@ -441,3 +441,101 @@ def plot_case_gallery(
     fig.suptitle(title)
     fig.tight_layout()
     return fig
+
+def plot_gt_vs_prediction_animation(
+    scenario,
+    scene_features: dict,
+    my_simulated_states: np.ndarray,
+    sample_index: int = 0,
+    current_idx: int = 10,
+    total_steps: int = 91,
+    interval: int = 100,
+    save_gif: bool = True,
+) -> animation.FuncAnimation:
+    type_names = {1: "Veh", 2: "Ped", 3: "Cyc"}
+
+    agent_data = []
+    for ai, track in enumerate(scenario.tracks):
+        states = track.states
+        if len(states) < current_idx + 1:
+            continue
+        curr = states[current_idx]
+        if not curr.valid:
+            continue
+        xs = [s.center_x if s.valid else np.nan for s in states[:total_steps]]
+        ys = [s.center_y if s.valid else np.nan for s in states[:total_steps]]
+        speed = np.sqrt(curr.velocity_x**2 + curr.velocity_y**2)
+        label = f"{ai}:{type_names.get(track.object_type,'?')} {speed:.1f}m/s"
+        agent_data.append((ai, xs, ys, label))
+
+    all_xs = [x for _, xs, _, _ in agent_data for x in xs if not np.isnan(x)]
+    all_ys = [y for _, _, ys, _ in agent_data for y in ys if not np.isnan(y)]
+    pad = 40
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+    for ax, title in [(ax1,"Ground Truth"), (ax2, "Model Prediction")]:
+        ax.set_facecolor("white")
+        visualizations.add_map(ax, scenario)
+        ax.set_xlim(min(all_xs)-pad, max(all_xs)+pad)
+        ax.set_ylim(min(all_ys)-pad, max(all_ys)+pad)
+        ax.set_aspect("equal")
+        ax.tick_params(colors="black")
+        ax.set_title(title, color="black", fontsize=14, fontweight="bold")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+
+    fig.patch.set_facecolor("white")
+    fig.suptitle(f"Scenario {scenario.scenario_id}", color = "black", fontsize = 16, fontweight = "bold", y = 0.98)
+
+    gt_trails = [ax1.plot([], [], "-", color = "red", lw = 1.5, alpha = 0.6)[0] for _ in agent_data]
+    gt_dots   = [ax1.plot([], [], "o", color = "dodgerblue", ms = 9, zorder = 6)[0] for _ in agent_data]
+    gt_labels = [ax1.text(0, 0, "", fontsize = 7, color = "black", zorder = 7) for _ in agent_data]
+
+    md_trails = [ax2.plot([], [], "-", color = "red", lw = 1.5, alpha = 0.6)[0] for _ in agent_data]
+    md_dots   = [ax2.plot([], [], "o", color = "dodgerblue", ms=9, zorder = 6)[0] for _ in agent_data]
+    md_labels = [ax2.text(0, 0, "", fontsize = 7, color = "black", zorder = 7) for _ in agent_data]
+
+    time_text = ax1.text(0.02, 0.97, "", transform = ax1.transAxes, color = "black", fontsize = 11, va = "top", fontweight = "bold")
+
+    def update(frame):
+        time_text.set_text(f"t = {frame - current_idx:+d}  ({(frame - current_idx)*0.1:+.1f}s)")
+        for idx, (ai, xs, ys, label) in enumerate(agent_data):
+            trail_x = [x for x in xs[:frame+1] if not np.isnan(x)]
+            trail_y = [y for y in ys[:frame+1] if not np.isnan(y)]
+            gt_trails[idx].set_data(trail_x, trail_y)
+            if not np.isnan(xs[frame]) and not np.isnan(ys[frame]):
+                gt_dots[idx].set_data([xs[frame]], [ys[frame]])
+                gt_labels[idx].set_position((xs[frame] + 2, ys[frame] + 2))
+                gt_labels[idx].set_text(label)
+            else:
+                gt_dots[idx].set_data([], [])
+                gt_labels[idx].set_text("")
+
+            if ai < my_simulated_states.shape[1]:
+                mx = my_simulated_states[sample_index, ai, frame, 0]
+                my = my_simulated_states[sample_index, ai, frame, 1]
+                md_trails[idx].set_data(
+                    [my_simulated_states[sample_index, ai, f, 0] for f in range(frame+1)],
+                    [my_simulated_states[sample_index, ai, f, 1] for f in range(frame+1)],
+                )
+                md_dots[idx].set_data([mx], [my])
+                md_labels[idx].set_position((mx + 2, my + 2))
+                md_labels[idx].set_text(label)
+
+        return gt_trails + gt_dots + gt_labels + md_trails + md_dots + md_labels + [time_text]
+
+    ani = animation.FuncAnimation(
+        fig, update,
+        frames = range(0, total_steps),
+        interval = interval,
+        blit = False,
+    )
+    plt.tight_layout()
+
+    if save_gif:
+        gif_path = save_animation_gif(ani, stem = f"comparison_{scenario.scenario_id}", fps = 10, dpi = 100)
+        print(f"GIF saved: {gif_path}")
+
+    plt.close(fig)
+    return ani
+
