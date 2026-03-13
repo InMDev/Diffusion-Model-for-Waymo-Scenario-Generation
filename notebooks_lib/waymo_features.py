@@ -30,7 +30,14 @@ TYPE_CYCLIST = 3
 
 HISTORY_STEPS = 11
 FUTURE_STEPS = 80
-NEIGHBORS_K = 6
+NEIGHBORS_K = 16
+
+MAP_POINT_STRIDE = 4
+MAP_POLYLINE_POINTS = 64
+MAP_POLYLINE_OVERLAP = 32
+MAP_POLYLINE_BUDGET = 256
+MAP_POINT_DIM = 11
+MAP_SIGNAL_DIM = 10
 
 DIFFUSION_SAMPLE_STEPS = 50
 GUIDANCE_SWEEP = [1.0, 1.2, 1.5]
@@ -69,48 +76,152 @@ def object_type_one_hot(object_type: int) -> np.ndarray:
         return np.array([0.0, 0.0, 1.0], dtype=np.float32)
     return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
+
+MAP_TYPE_TO_INDEX = {
+    "lane": 0,
+    "road_line": 1,
+    "road_edge": 2,
+    "crosswalk": 3,
+    "speed_bump": 4,
+    "stop_sign": 5,
+    "other": 6,
+}
+MAP_TYPE_DIM = 7
+
+SIGNAL_NO_SIGNAL = 0
+SIGNAL_UNKNOWN = 1
+SIGNAL_CLASS_FROM_STATE = {
+    0: SIGNAL_UNKNOWN,
+    1: 2,
+    2: 3,
+    3: 4,
+    4: 5,
+    5: 6,
+    6: 7,
+    7: 8,
+    8: 9,
+}
+
 def _extract_polyline_points(polyline) -> np.ndarray:
     if polyline is None or len(polyline) == 0:
         return np.zeros((0, 2), dtype=np.float32)
     return np.array([(p.x, p.y) for p in polyline], dtype=np.float32)
 
-def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int = 5) -> dict:
+def _extract_polygon_points(polygon) -> np.ndarray:
+    if polygon is None or len(polygon) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    pts = np.array([(p.x, p.y) for p in polygon], dtype=np.float32)
+    if pts.shape[0] > 2:
+        pts = np.concatenate([pts, pts[:1]], axis=0)
+    return pts
+
+
+def _downsample_points(pts: np.ndarray, point_stride: int) -> np.ndarray:
+    if pts.shape[0] == 0 or point_stride <= 1:
+        return pts
+    sampled = pts[::point_stride]
+    if sampled.shape[0] == 1 and pts.shape[0] > 1:
+        sampled = np.stack([pts[0], pts[-1]], axis=0)
+    return sampled
+
+
+def _compute_unit_dirs(pts: np.ndarray) -> np.ndarray:
+    if pts.shape[0] >= 2:
+        seg = pts[1:] - pts[:-1]
+        seg_norm = np.linalg.norm(seg, axis=1, keepdims=True) + 1e-6
+        unit = seg / seg_norm
+        return np.concatenate([unit, unit[-1:]], axis=0)
+    return np.array([[1.0, 0.0]], dtype=np.float32)
+
+
+def _split_polyline_segments(
+    pts: np.ndarray,
+    seg_len: int = MAP_POLYLINE_POINTS,
+    overlap: int = MAP_POLYLINE_OVERLAP,
+) -> list[np.ndarray]:
+    if pts.shape[0] == 0:
+        return []
+    if pts.shape[0] <= seg_len:
+        return [pts]
+
+    step = max(1, seg_len - overlap)
+    out = []
+    starts = list(range(0, pts.shape[0] - seg_len + 1, step))
+    if starts[-1] != (pts.shape[0] - seg_len):
+        starts.append(pts.shape[0] - seg_len)
+    for start in starts:
+        out.append(pts[start : start + seg_len])
+    return out
+
+
+def _extract_lane_states_by_time(
+    scenario_proto: scenario_pb2.Scenario,
+    lane_id_set: set[int],
+) -> tuple[list[dict[int, int]], dict[str, int]]:
+    lane_states_by_time: list[dict[int, int]] = []
+    total = 0
+    matched = 0
+
+    for dyn_state in scenario_proto.dynamic_map_states:
+        lane_map: dict[int, int] = {}
+        for lane_state in dyn_state.lane_states:
+            lane_id = int(getattr(lane_state, "lane", -1))
+            state = int(getattr(lane_state, "state", 0))
+            lane_map[lane_id] = state
+            total += 1
+            if lane_id in lane_id_set:
+                matched += 1
+        lane_states_by_time.append(lane_map)
+
+    return lane_states_by_time, {"total": total, "matched": matched}
+
+
+def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int = MAP_POINT_STRIDE) -> dict:
     lane_points = []
     lane_dirs = []
     road_edge_points = []
+    map_segments = []
+    lane_id_set: set[int] = set()
 
     for map_feature in scenario_proto.map_features:
         feature_name = map_feature.WhichOneof("feature_data")
-        if feature_name not in {"lane", "road_line", "road_edge"}:
+        if feature_name is None:
             continue
 
         feature = getattr(map_feature, feature_name)
         polyline = getattr(feature, "polyline", None)
+        polygon = getattr(feature, "polygon", None)
+
         pts = _extract_polyline_points(polyline)
+        if pts.shape[0] == 0:
+            pts = _extract_polygon_points(polygon)
+        if pts.shape[0] == 0:
+            continue
+        pts = _downsample_points(pts, point_stride=point_stride)
         if pts.shape[0] == 0:
             continue
 
-        if point_stride > 1:
-            pts = pts[::point_stride]
-            if pts.shape[0] == 1 and len(polyline) > 1:
-                pts = np.array(
-                    [(polyline[0].x, polyline[0].y), (polyline[-1].x, polyline[-1].y)],
-                    dtype=np.float32,
-                )
-
-        if feature_name == "road_edge":
+        if feature_name in {"lane", "road_line"}:
+            lane_points.append(pts)
+            lane_dirs.append(_compute_unit_dirs(pts))
+        elif feature_name == "road_edge":
             road_edge_points.append(pts)
-            continue
 
-        lane_points.append(pts)
-        if pts.shape[0] >= 2:
-            seg = pts[1:] - pts[:-1]
-            seg_norm = np.linalg.norm(seg, axis=1, keepdims=True) + 1e-6
-            unit = seg / seg_norm
-            dirs = np.concatenate([unit, unit[-1:]], axis=0)
-        else:
-            dirs = np.array([[1.0, 0.0]], dtype=np.float32)
-        lane_dirs.append(dirs)
+        type_idx = MAP_TYPE_TO_INDEX.get(feature_name, MAP_TYPE_TO_INDEX["other"])
+        lane_id: int | None = None
+        if feature_name == "lane":
+            lane_id = int(map_feature.id)
+            lane_id_set.add(lane_id)
+
+        for seg_pts in _split_polyline_segments(pts):
+            map_segments.append(
+                {
+                    "points": seg_pts.astype(np.float32),
+                    "dirs": _compute_unit_dirs(seg_pts).astype(np.float32),
+                    "type_idx": int(type_idx),
+                    "lane_id": lane_id,
+                }
+            )
 
     if lane_points:
         lane_points = np.concatenate(lane_points, axis=0)
@@ -124,10 +235,18 @@ def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int 
     else:
         road_edge_points = np.zeros((0, 2), dtype=np.float32)
 
+    lane_states_by_time, traffic_stats = _extract_lane_states_by_time(
+        scenario_proto=scenario_proto,
+        lane_id_set=lane_id_set,
+    )
+
     return {
         "lane_points": lane_points,
         "lane_dirs": lane_dirs,
         "road_edge_points": road_edge_points,
+        "map_segments": map_segments,
+        "lane_states_by_time": lane_states_by_time,
+        "traffic_stats": traffic_stats,
     }
 
 def compute_map_context(anchor_xy: np.ndarray, anchor_heading: float, map_cache: dict) -> np.ndarray:
@@ -160,6 +279,90 @@ def compute_map_context(anchor_xy: np.ndarray, anchor_heading: float, map_cache:
         map_valid = 1.0
 
     return np.array([dist_lane, lane_sin, lane_cos, dist_edge, map_valid], dtype=np.float32)
+
+
+def _to_local_points(points_xy: np.ndarray, anchor_xy: np.ndarray, anchor_heading: float) -> np.ndarray:
+    if points_xy.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    rel = points_xy - anchor_xy[None, :]
+    c = math.cos(anchor_heading)
+    s = math.sin(anchor_heading)
+    lx = c * rel[:, 0] + s * rel[:, 1]
+    ly = -s * rel[:, 0] + c * rel[:, 1]
+    return np.stack([lx, ly], axis=1).astype(np.float32)
+
+
+def _rotate_dirs_to_local(dirs_xy: np.ndarray, anchor_heading: float) -> np.ndarray:
+    if dirs_xy.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    c = math.cos(anchor_heading)
+    s = math.sin(anchor_heading)
+    lx = c * dirs_xy[:, 0] + s * dirs_xy[:, 1]
+    ly = -s * dirs_xy[:, 0] + c * dirs_xy[:, 1]
+    return np.stack([lx, ly], axis=1).astype(np.float32)
+
+
+def build_local_map_tensors(
+    anchor_xy: np.ndarray,
+    anchor_heading: float,
+    map_cache: dict,
+    anchor_t: int,
+    map_budget: int = MAP_POLYLINE_BUDGET,
+    polyline_points: int = MAP_POLYLINE_POINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    map_polyline = np.zeros((map_budget, polyline_points, MAP_POINT_DIM), dtype=np.float32)
+    map_point_valid = np.zeros((map_budget, polyline_points), dtype=np.float32)
+    map_polyline_valid = np.zeros((map_budget,), dtype=np.float32)
+    map_signal = np.zeros((map_budget, MAP_SIGNAL_DIM), dtype=np.float32)
+    map_signal[:, SIGNAL_NO_SIGNAL] = 1.0
+
+    segments = map_cache.get("map_segments", [])
+    lane_states_by_time = map_cache.get("lane_states_by_time", [])
+    if len(lane_states_by_time) > 0:
+        lane_state_t = lane_states_by_time[min(max(anchor_t, 0), len(lane_states_by_time) - 1)]
+    else:
+        lane_state_t = {}
+
+    if len(segments) == 0:
+        return map_polyline, map_point_valid, map_polyline_valid, map_signal
+
+    dist_rank = []
+    for idx, seg in enumerate(segments):
+        pts = seg["points"]
+        if pts.shape[0] == 0:
+            continue
+        d2 = np.sum((pts - anchor_xy[None, :]) ** 2, axis=1)
+        dist_rank.append((float(np.min(d2)), idx))
+    dist_rank.sort(key=lambda x_: x_[0])
+    chosen = dist_rank[:map_budget]
+
+    for out_idx, (_, seg_idx) in enumerate(chosen):
+        seg = segments[seg_idx]
+        pts = seg["points"]
+        dirs = seg["dirs"]
+        n = min(polyline_points, pts.shape[0])
+        if n <= 0:
+            continue
+
+        local_pts = _to_local_points(pts[:n], anchor_xy=anchor_xy, anchor_heading=anchor_heading)
+        local_dirs = _rotate_dirs_to_local(dirs[:n], anchor_heading=anchor_heading)
+        map_polyline[out_idx, :n, 0:2] = local_pts
+        map_polyline[out_idx, :n, 2:4] = local_dirs
+        type_idx = int(seg.get("type_idx", MAP_TYPE_TO_INDEX["other"]))
+        if 0 <= type_idx < MAP_TYPE_DIM:
+            map_polyline[out_idx, :n, 4 + type_idx] = 1.0
+        map_point_valid[out_idx, :n] = 1.0
+        map_polyline_valid[out_idx] = 1.0
+
+        lane_id = seg.get("lane_id", None)
+        map_signal[out_idx] = 0.0
+        if lane_id is None or int(lane_id) not in lane_state_t:
+            map_signal[out_idx, SIGNAL_NO_SIGNAL] = 1.0
+        else:
+            state_idx = SIGNAL_CLASS_FROM_STATE.get(int(lane_state_t[int(lane_id)]), SIGNAL_UNKNOWN)
+            map_signal[out_idx, int(state_idx)] = 1.0
+
+    return map_polyline, map_point_valid, map_polyline_valid, map_signal
 
 def get_sim_agent_trajectories(scenario_proto: scenario_pb2.Scenario, challenge_type):
     full = trajectory_utils.ObjectTrajectories.from_scenario(scenario_proto)
@@ -392,7 +595,12 @@ def build_rollout_condition_batch(
 
     hist = np.zeros((n_obj, H, 13), dtype=np.float32)
     nbr = np.zeros((n_obj, K, 10), dtype=np.float32)
-    map_feat = np.zeros((n_obj, 5), dtype=np.float32)
+    map_scalar = np.zeros((n_obj, 5), dtype=np.float32)
+    map_polyline = np.zeros((n_obj, MAP_POLYLINE_BUDGET, MAP_POLYLINE_POINTS, MAP_POINT_DIM), dtype=np.float32)
+    map_point_valid = np.zeros((n_obj, MAP_POLYLINE_BUDGET, MAP_POLYLINE_POINTS), dtype=np.float32)
+    map_polyline_valid = np.zeros((n_obj, MAP_POLYLINE_BUDGET), dtype=np.float32)
+    map_signal = np.zeros((n_obj, MAP_POLYLINE_BUDGET, MAP_SIGNAL_DIM), dtype=np.float32)
+    map_signal[..., SIGNAL_NO_SIGNAL] = 1.0
     static = np.zeros((n_obj, 7), dtype=np.float32)
 
     hist_valid = np.zeros((n_obj, H), dtype=np.float32)
@@ -455,19 +663,38 @@ def build_rollout_condition_batch(
             nbr_valid[i, k_idx] = 1.0
 
         map_i = compute_map_context(anchor_xy, anchor_h, map_cache)
-        map_feat[i] = map_i
+        map_scalar[i] = map_i
         map_valid[i, 0] = map_i[-1]
+        map_poly_i, map_pt_valid_i, map_poly_valid_i, map_sig_i = build_local_map_tensors(
+            anchor_xy=anchor_xy,
+            anchor_heading=anchor_h,
+            map_cache=map_cache,
+            anchor_t=safe_t,
+            map_budget=MAP_POLYLINE_BUDGET,
+            polyline_points=MAP_POLYLINE_POINTS,
+        )
+        map_polyline[i] = map_poly_i
+        map_point_valid[i] = map_pt_valid_i
+        map_polyline_valid[i] = map_poly_valid_i
+        map_signal[i] = map_sig_i
 
     cond = {
         "hist": torch.from_numpy(hist).to(DEVICE),
         "nbr": torch.from_numpy(nbr).to(DEVICE),
-        "map": torch.from_numpy(map_feat).to(DEVICE),
+        "map": torch.from_numpy(map_scalar).to(DEVICE),
+        "map_scalar": torch.from_numpy(map_scalar).to(DEVICE),
+        "map_polyline": torch.from_numpy(map_polyline).to(DEVICE),
+        "map_point_valid": torch.from_numpy(map_point_valid).to(DEVICE),
+        "map_polyline_valid": torch.from_numpy(map_polyline_valid).to(DEVICE),
+        "map_signal": torch.from_numpy(map_signal).to(DEVICE),
         "static": torch.from_numpy(static).to(DEVICE),
         "masks": {
             "hist_valid": torch.from_numpy(hist_valid).to(DEVICE),
             "target_valid": torch.ones((n_obj, FUTURE_STEPS), dtype=torch.float32, device=DEVICE),
             "nbr_valid": torch.from_numpy(nbr_valid).to(DEVICE),
             "map_valid": torch.from_numpy(map_valid).to(DEVICE),
+            "map_polyline_valid": torch.from_numpy(map_polyline_valid).to(DEVICE),
+            "map_point_valid": torch.from_numpy(map_point_valid).to(DEVICE),
         },
     }
     return cond

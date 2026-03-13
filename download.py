@@ -4,11 +4,25 @@ import os
 import random
 import shutil
 import subprocess
+import time
 from pathlib import Path
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_TRT_LOGGER_VERBOSITY'] = '0'
 
 import numpy as np
 import tensorflow as tf
+tf.get_logger().setLevel('ERROR')
 import torch
+from tqdm import tqdm
+
+# Configure TensorFlow for CPU-only mode with optimized parallelism.
+# Main process handles TFRecord IO so it benefits from a few more threads;
+# cap at half the cores so spawned workers still have room.
+tf.config.set_visible_devices([], 'GPU')
+_MAIN_TF_THREADS = max(1, (os.cpu_count() or 2) // 4)
+tf.config.threading.set_inter_op_parallelism_threads(_MAIN_TF_THREADS)
+tf.config.threading.set_intra_op_parallelism_threads(_MAIN_TF_THREADS)
 
 from waymo_open_dataset.protos import scenario_pb2
 from waymo_open_dataset.utils import trajectory_utils
@@ -24,31 +38,49 @@ CURRENT_TIME_INDEX = 10
 HISTORY_STEPS = CURRENT_TIME_INDEX + 1
 FUTURE_STEPS = 80
 TOTAL_SCENE_STEPS = HISTORY_STEPS + FUTURE_STEPS
-NEIGHBORS_K = 6
+NEIGHBORS_K = 16
 ANCHOR_MIN_T = CURRENT_TIME_INDEX
 ANCHOR_MAX_T = 70
 ANCHOR_STRIDE = 5
 MIN_FUTURE_VALID_AUX = 20
 MULTI_ANCHOR = True
 
+MAP_SCHEMA_VERSION = "v2"
+MAP_POINT_STRIDE = 4
+MAP_POLYLINE_POINTS = 64
+MAP_POLYLINE_OVERLAP = 32
+MAP_POLYLINE_BUDGET = 256
+MAP_POINT_DIM = 11
+MAP_SIGNAL_DIM = 10
+
 # Long-tail emphasis inspired by high-speed failure analysis in challenge reports.
 HIGH_SPEED_STEP_THRESHOLD = 2.6  # ~26 m/s (approx 58 mph) in 0.1s delta units
 EDGE_NEAR_THRESHOLD_M = 6.0
 HARD_CASE_DUPLICATION_FACTOR = 2
 
-MAX_TRAIN_SCENARIOS = 5000
-MAX_VAL_SCENARIOS = 1000
+MAX_TRAIN_SCENARIOS = 150000  # Unlimited (1000 files × 150 scenarios each)
+MAX_VAL_SCENARIOS = 150  # Only validation scenarios
 FILES_PER_BATCH = 1
-SHARD_SIZE = 12000
+# v2 samples are substantially larger due to map polyline tensors.
+# Keep shards smaller to avoid multi-GB in-memory buffering that can look frozen.
+SHARD_SIZE = 1024
 REBUILD_EXISTING_CACHE = True
-TEST_MODE = False  
-NUM_WORKERS = 10 
+TEST_MODE = False
 
-LOCAL_STORAGE_BUDGET_GB = 100.0
-RESERVED_FREE_SPACE_GB = 15.0
+# Auto-scale workers: leave 2 cores for the main process (GCS download + orchestration).
+# Each worker uses 1 TF intra/inter thread (lightweight protobuf + eager ops), so
+# total CPU usage ≈ (CPU_COUNT - 2) + 2 = CPU_COUNT with no over-subscription.
+CPU_COUNT = os.cpu_count() or 1
+# Conservative default for stability; raise manually after confirming throughput.
+NUM_WORKERS = min(4, max(1, CPU_COUNT - 2))
+PROGRESS_PRINT_EVERY = 10
+
+# Optimized for 113 GB available storage
+LOCAL_STORAGE_BUDGET_GB = 110.0  # Use 110 GB of 113 GB available
+RESERVED_FREE_SPACE_GB = 3.0     # Keep 3 GB free buffer
 TEMP_DOWNLOAD_BUDGET_GB = 2.0
-TRAIN_CACHE_BUDGET_GB = 65.0
-VAL_CACHE_BUDGET_GB = 8.0
+TRAIN_CACHE_BUDGET_GB = 95.0     # Maximize training data
+VAL_CACHE_BUDGET_GB = 5.0        # Minimal validation space needed
 
 CACHE_ROOT = Path("./waymo_cache_v2")
 TRAIN_CACHE_DIR = CACHE_ROOT / "train"
@@ -66,7 +98,8 @@ assert FUTURE_STEPS == 80
 assert TOTAL_SCENE_STEPS == 91
 assert ANCHOR_MIN_T == CURRENT_TIME_INDEX
 assert HARD_CASE_DUPLICATION_FACTOR >= 1
-assert TRAIN_CACHE_BUDGET_GB + VAL_CACHE_BUDGET_GB + TEMP_DOWNLOAD_BUDGET_GB <= (LOCAL_STORAGE_BUDGET_GB - RESERVED_FREE_SPACE_GB)
+assert TRAIN_CACHE_BUDGET_GB + VAL_CACHE_BUDGET_GB + TEMP_DOWNLOAD_BUDGET_GB <= (LOCAL_STORAGE_BUDGET_GB - RESERVED_FREE_SPACE_GB), \
+    f"Storage budget {TRAIN_CACHE_BUDGET_GB + VAL_CACHE_BUDGET_GB + TEMP_DOWNLOAD_BUDGET_GB} GB exceeds available {LOCAL_STORAGE_BUDGET_GB - RESERVED_FREE_SPACE_GB} GB"
 
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
@@ -126,12 +159,29 @@ class StreamingWaymoDataset:
             batch = self.all_files[file_cursor:file_cursor + self.files_per_batch]
             if not batch:
                 break
+            
             file_cursor += len(batch)
 
-            subprocess.run(
-                ["gsutil", "-m", "cp"] + batch + [str(self.batch_dir) + "/"],
-                check=True,
-                capture_output=True,
+            first_name = os.path.basename(batch[0]) if len(batch) > 0 else "unknown"
+            print(
+                f"[{self.split_name}] Downloading batch ({len(batch)} file(s)) "
+                f"cursor={file_cursor}/{len(self.all_files)} first={first_name}"
+            )
+            t0 = time.time()
+            try:
+                subprocess.run(
+                    ["gsutil", "-m", "cp"] + batch + [str(self.batch_dir) + "/"],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or "").strip()
+                stdout = (e.stdout or "").strip()
+                msg = stderr if stderr else stdout
+                raise RuntimeError(f"[{self.split_name}] gsutil copy failed: {msg[:500]}") from e
+            print(
+                f"[{self.split_name}] Download complete in {time.time() - t0:.1f}s "
+                f"(scenarios_yielded={scenarios_yielded})"
             )
 
             temp_size_gb = bytes_to_gb(directory_size_bytes(self.batch_dir))
@@ -181,6 +231,32 @@ def object_type_one_hot(object_type: int) -> np.ndarray:
         return np.array([0.0, 0.0, 1.0], dtype=np.float32)
     return np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
+
+MAP_TYPE_TO_INDEX = {
+    "lane": 0,
+    "road_line": 1,
+    "road_edge": 2,
+    "crosswalk": 3,
+    "speed_bump": 4,
+    "stop_sign": 5,
+    "other": 6,
+}
+MAP_TYPE_DIM = 7
+
+SIGNAL_NO_SIGNAL = 0
+SIGNAL_UNKNOWN = 1
+SIGNAL_CLASS_FROM_STATE = {
+    0: SIGNAL_UNKNOWN,   # UNKNOWN
+    1: 2,                # ARROW_STOP
+    2: 3,                # ARROW_CAUTION
+    3: 4,                # ARROW_GO
+    4: 5,                # STOP
+    5: 6,                # CAUTION
+    6: 7,                # GO
+    7: 8,                # FLASHING_STOP
+    8: 9,                # FLASHING_CAUTION
+}
+
 def scenario_id_to_int(scenario_id: str) -> int:
     try:
         return int(scenario_id[:16], 16)
@@ -192,47 +268,130 @@ def _extract_polyline_points(polyline) -> np.ndarray:
         return np.zeros((0, 2), dtype=np.float32)
     return np.array([(p.x, p.y) for p in polyline], dtype=np.float32)
 
-def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int = 5) -> dict:
+def _extract_polygon_points(polygon) -> np.ndarray:
+    if polygon is None or len(polygon) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    pts = np.array([(p.x, p.y) for p in polygon], dtype=np.float32)
+    # close polygon loop for consistent direction features.
+    if pts.shape[0] > 2:
+        pts = np.concatenate([pts, pts[:1]], axis=0)
+    return pts
+
+
+def _downsample_points(pts: np.ndarray, point_stride: int) -> np.ndarray:
+    if pts.shape[0] == 0 or point_stride <= 1:
+        return pts
+    sampled = pts[::point_stride]
+    if sampled.shape[0] == 1 and pts.shape[0] > 1:
+        sampled = np.stack([pts[0], pts[-1]], axis=0)
+    return sampled
+
+
+def _compute_unit_dirs(pts: np.ndarray) -> np.ndarray:
+    if pts.shape[0] >= 2:
+        seg = pts[1:] - pts[:-1]
+        seg_norm = np.linalg.norm(seg, axis=1, keepdims=True) + 1e-6
+        unit = seg / seg_norm
+        return np.concatenate([unit, unit[-1:]], axis=0)
+    return np.array([[1.0, 0.0]], dtype=np.float32)
+
+
+def _split_polyline_segments(
+    pts: np.ndarray,
+    seg_len: int = MAP_POLYLINE_POINTS,
+    overlap: int = MAP_POLYLINE_OVERLAP,
+) -> list[np.ndarray]:
+    if pts.shape[0] == 0:
+        return []
+    if pts.shape[0] <= seg_len:
+        return [pts]
+
+    step = max(1, seg_len - overlap)
+    out = []
+    starts = list(range(0, pts.shape[0] - seg_len + 1, step))
+    if starts[-1] != (pts.shape[0] - seg_len):
+        starts.append(pts.shape[0] - seg_len)
+    for start in starts:
+        out.append(pts[start : start + seg_len])
+    return out
+
+
+def _extract_lane_states_by_time(
+    scenario_proto: scenario_pb2.Scenario,
+    lane_id_set: set[int],
+) -> tuple[list[dict[int, int]], dict[str, int]]:
+    lane_states_by_time: list[dict[int, int]] = []
+    total = 0
+    matched = 0
+
+    for dyn_state in scenario_proto.dynamic_map_states:
+        lane_map: dict[int, int] = {}
+        for lane_state in dyn_state.lane_states:
+            lane_id = int(getattr(lane_state, "lane", -1))
+            state = int(getattr(lane_state, "state", 0))
+            lane_map[lane_id] = state
+            total += 1
+            if lane_id in lane_id_set:
+                matched += 1
+        lane_states_by_time.append(lane_map)
+
+    return lane_states_by_time, {"total": total, "matched": matched}
+
+
+def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int = MAP_POINT_STRIDE) -> dict:
     """
-    Parses protobuf map features to extract lane point coordinates and road edge locations.
-    Downsamples the points using point_stride to reduce memory usage.
+    Parses protobuf map features into two views:
+    - legacy lane/edge arrays for compatibility losses/postprocess
+    - segmented polylines for v2 map encoder input
     """
     lane_points = []
     lane_dirs = []
     road_edge_points = []
+    map_segments = []
+    centroids = []
+    lane_id_set: set[int] = set()
 
     for map_feature in scenario_proto.map_features:
         feature_name = map_feature.WhichOneof("feature_data")
-        if feature_name not in {"lane", "road_line", "road_edge"}:
+        if feature_name is None:
             continue
 
         feature = getattr(map_feature, feature_name)
         polyline = getattr(feature, "polyline", None)
+        polygon = getattr(feature, "polygon", None)
+
         pts = _extract_polyline_points(polyline)
+        if pts.shape[0] == 0:
+            pts = _extract_polygon_points(polygon)
         if pts.shape[0] == 0:
             continue
 
-        if point_stride > 1:
-            pts = pts[::point_stride]
-            if pts.shape[0] == 1 and len(polyline) > 1:
-                pts = np.array(
-                    [(polyline[0].x, polyline[0].y), (polyline[-1].x, polyline[-1].y)],
-                    dtype=np.float32,
-                )
-
-        if feature_name == "road_edge":
-            road_edge_points.append(pts)
+        pts = _downsample_points(pts, point_stride=point_stride)
+        if pts.shape[0] == 0:
             continue
 
-        lane_points.append(pts)
-        if pts.shape[0] >= 2:
-            seg = pts[1:] - pts[:-1]
-            seg_norm = np.linalg.norm(seg, axis=1, keepdims=True) + 1e-6
-            unit = seg / seg_norm
-            dirs = np.concatenate([unit, unit[-1:]], axis=0)
-        else:
-            dirs = np.array([[1.0, 0.0]], dtype=np.float32)
-        lane_dirs.append(dirs)
+        if feature_name in {"lane", "road_line"}:
+            lane_points.append(pts)
+            lane_dirs.append(_compute_unit_dirs(pts))
+        elif feature_name == "road_edge":
+            road_edge_points.append(pts)
+
+        type_idx = MAP_TYPE_TO_INDEX.get(feature_name, MAP_TYPE_TO_INDEX["other"])
+        feature_lane_id: int | None = None
+        if feature_name == "lane":
+            feature_lane_id = int(map_feature.id)
+            lane_id_set.add(feature_lane_id)
+
+        for seg_pts in _split_polyline_segments(pts):
+            map_segments.append(
+                {
+                    "points": seg_pts.astype(np.float32),
+                    "dirs": _compute_unit_dirs(seg_pts).astype(np.float32),
+                    "type_idx": int(type_idx),
+                    "lane_id": feature_lane_id,
+                }
+            )
+            centroids.append(np.mean(seg_pts, axis=0))
 
     if lane_points:
         lane_points = np.concatenate(lane_points, axis=0)
@@ -246,10 +405,24 @@ def extract_map_arrays(scenario_proto: scenario_pb2.Scenario, point_stride: int 
     else:
         road_edge_points = np.zeros((0, 2), dtype=np.float32)
 
+    if centroids:
+        centroids = np.stack(centroids).astype(np.float32)
+    else:
+        centroids = np.zeros((0, 2), dtype=np.float32)
+
+    lane_states_by_time, traffic_stats = _extract_lane_states_by_time(
+        scenario_proto=scenario_proto,
+        lane_id_set=lane_id_set,
+    )
+
     return {
         "lane_points": lane_points,
         "lane_dirs": lane_dirs,
         "road_edge_points": road_edge_points,
+        "map_segments": map_segments,
+        "centroids": centroids,
+        "lane_states_by_time": lane_states_by_time,
+        "traffic_stats": traffic_stats,
     }
 
 def compute_map_context(anchor_xy: np.ndarray, anchor_heading: float, map_cache: dict) -> np.ndarray:
@@ -283,20 +456,116 @@ def compute_map_context(anchor_xy: np.ndarray, anchor_heading: float, map_cache:
 
     return np.array([dist_lane, lane_sin, lane_cos, dist_edge, map_valid], dtype=np.float32)
 
+
+def _to_local_points(points_xy: np.ndarray, anchor_xy: np.ndarray, anchor_heading: float) -> np.ndarray:
+    if points_xy.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    rel = points_xy - anchor_xy[None, :]
+    c = math.cos(anchor_heading)
+    s = math.sin(anchor_heading)
+    lx = c * rel[:, 0] + s * rel[:, 1]
+    ly = -s * rel[:, 0] + c * rel[:, 1]
+    return np.stack([lx, ly], axis=1).astype(np.float32)
+
+
+def _rotate_dirs_to_local(dirs_xy: np.ndarray, anchor_heading: float) -> np.ndarray:
+    if dirs_xy.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    c = math.cos(anchor_heading)
+    s = math.sin(anchor_heading)
+    lx = c * dirs_xy[:, 0] + s * dirs_xy[:, 1]
+    ly = -s * dirs_xy[:, 0] + c * dirs_xy[:, 1]
+    return np.stack([lx, ly], axis=1).astype(np.float32)
+
+
+def build_local_map_tensors(
+    anchor_xy: np.ndarray,
+    anchor_heading: float,
+    map_cache: dict,
+    anchor_t: int,
+    map_budget: int = MAP_POLYLINE_BUDGET,
+    polyline_points: int = MAP_POLYLINE_POINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    map_polyline = np.zeros((map_budget, polyline_points, MAP_POINT_DIM), dtype=np.float32)
+    map_point_valid = np.zeros((map_budget, polyline_points), dtype=np.float32)
+    map_polyline_valid = np.zeros((map_budget,), dtype=np.float32)
+    map_signal = np.zeros((map_budget, MAP_SIGNAL_DIM), dtype=np.float32)
+    map_signal[:, SIGNAL_NO_SIGNAL] = 1.0
+
+    segments = map_cache.get("map_segments", [])
+    centroids = map_cache.get("centroids", np.zeros((0, 2), dtype=np.float32))
+    
+    lane_states_by_time = map_cache.get("lane_states_by_time", [])
+    if len(lane_states_by_time) > 0:
+        lane_state_t = lane_states_by_time[min(max(anchor_t, 0), len(lane_states_by_time) - 1)]
+    else:
+        lane_state_t = {}
+
+    if len(segments) == 0:
+        return map_polyline, map_point_valid, map_polyline_valid, map_signal
+
+    # Vectorized distance computation from anchor to all segment centroids
+    d2 = np.sum((centroids - anchor_xy[None, :]) ** 2, axis=1)
+    
+    if len(segments) <= map_budget:
+        chosen_indices = np.argsort(d2)
+    else:
+        # argpartition is O(N) instead of O(N log N) for argsort
+        chosen_indices = np.argpartition(d2, map_budget - 1)[:map_budget]
+        # sort just the top ones so the very closest are first
+        chosen_indices = chosen_indices[np.argsort(d2[chosen_indices])]
+
+    for out_idx, seg_idx in enumerate(chosen_indices):
+        seg = segments[seg_idx]
+        pts = seg["points"]
+        dirs = seg["dirs"]
+        n = min(polyline_points, pts.shape[0])
+        if n <= 0:
+            continue
+
+        local_pts = _to_local_points(pts[:n], anchor_xy=anchor_xy, anchor_heading=anchor_heading)
+        local_dirs = _rotate_dirs_to_local(dirs[:n], anchor_heading=anchor_heading)
+
+        map_polyline[out_idx, :n, 0:2] = local_pts
+        map_polyline[out_idx, :n, 2:4] = local_dirs
+        type_idx = int(seg.get("type_idx", MAP_TYPE_TO_INDEX["other"]))
+        if 0 <= type_idx < MAP_TYPE_DIM:
+            map_polyline[out_idx, :n, 4 + type_idx] = 1.0
+        map_point_valid[out_idx, :n] = 1.0
+        map_polyline_valid[out_idx] = 1.0
+
+        lane_id = seg.get("lane_id", None)
+        map_signal[out_idx] = 0.0
+        if lane_id is None or int(lane_id) not in lane_state_t:
+            map_signal[out_idx, SIGNAL_NO_SIGNAL] = 1.0
+        else:
+            state_idx = SIGNAL_CLASS_FROM_STATE.get(int(lane_state_t[int(lane_id)]), SIGNAL_UNKNOWN)
+            map_signal[out_idx, int(state_idx)] = 1.0
+
+    return map_polyline, map_point_valid, map_polyline_valid, map_signal
+
 def _empty_sample_dict(H: int, F: int, K: int) -> dict:
     return {
-        "hist": torch.zeros((0, H, 13), dtype=torch.float32),
-        "nbr": torch.zeros((0, K, 10), dtype=torch.float32),
-        "map": torch.zeros((0, 5), dtype=torch.float32),
-        "static": torch.zeros((0, 7), dtype=torch.float32),
-        "target": torch.zeros((0, F, 4), dtype=torch.float32),
+        "hist": np.zeros((0, H, 13), dtype=np.float32),
+        "nbr": np.zeros((0, K, 10), dtype=np.float32),
+        "map": np.zeros((0, 5), dtype=np.float32),
+        "map_scalar": np.zeros((0, 5), dtype=np.float32),
+        "map_polyline": np.zeros((0, MAP_POLYLINE_BUDGET, MAP_POLYLINE_POINTS, MAP_POINT_DIM), dtype=np.float32),
+        "map_point_valid": np.zeros((0, MAP_POLYLINE_BUDGET, MAP_POLYLINE_POINTS), dtype=np.float32),
+        "map_polyline_valid": np.zeros((0, MAP_POLYLINE_BUDGET), dtype=np.float32),
+        "map_signal": np.zeros((0, MAP_POLYLINE_BUDGET, MAP_SIGNAL_DIM), dtype=np.float32),
+        "static": np.zeros((0, 7), dtype=np.float32),
+        "target": np.zeros((0, F, 4), dtype=np.float32),
         "masks": {
-            "hist_valid": torch.zeros((0, H), dtype=torch.float32),
-            "target_valid": torch.zeros((0, F), dtype=torch.float32),
-            "nbr_valid": torch.zeros((0, K), dtype=torch.float32),
-            "map_valid": torch.zeros((0, 1), dtype=torch.float32),
+            "hist_valid": np.zeros((0, H), dtype=np.float32),
+            "target_valid": np.zeros((0, F), dtype=np.float32),
+            "nbr_valid": np.zeros((0, K), dtype=np.float32),
+            "map_valid": np.zeros((0, 1), dtype=np.float32),
+            "map_polyline_valid": np.zeros((0, MAP_POLYLINE_BUDGET), dtype=np.float32),
+            "map_point_valid": np.zeros((0, MAP_POLYLINE_BUDGET, MAP_POLYLINE_POINTS), dtype=np.float32),
         },
-        "meta": torch.zeros((0, 7), dtype=torch.float32),
+        "meta": np.zeros((0, 7), dtype=np.float32),
+        "traffic_stats": {"total": 0, "matched": 0},
     }
 
 def build_training_samples_from_scenario(
@@ -357,12 +626,19 @@ def build_training_samples_from_scenario(
     hist_list = []
     nbr_list = []
     map_list = []
+    map_scalar_list = []
+    map_polyline_list = []
+    map_point_valid_list = []
+    map_polyline_valid_list = []
+    map_signal_list = []
     static_list = []
     target_list = []
     hist_valid_list = []
     target_valid_list = []
     nbr_valid_list = []
     map_valid_list = []
+    map_polyline_mask_list = []
+    map_point_mask_list = []
     meta_list = []
 
     max_anchor = min(ANCHOR_MAX_T, n_steps - 2)
@@ -478,8 +754,16 @@ def build_training_samples_from_scenario(
                 )
                 nbr_valid[k_idx] = 1.0
 
-            map_feat = compute_map_context(anchor_xy, anchor_heading, map_cache)
-            map_valid = np.array([map_feat[-1]], dtype=np.float32)
+            map_scalar = compute_map_context(anchor_xy, anchor_heading, map_cache)
+            map_valid = np.array([map_scalar[-1]], dtype=np.float32)
+            map_polyline, map_point_valid, map_polyline_valid, map_signal = build_local_map_tensors(
+                anchor_xy=anchor_xy,
+                anchor_heading=anchor_heading,
+                map_cache=map_cache,
+                anchor_t=anchor_t,
+                map_budget=MAP_POLYLINE_BUDGET,
+                polyline_points=MAP_POLYLINE_POINTS,
+            )
 
             static_feat = np.concatenate(
                 [
@@ -507,38 +791,61 @@ def build_training_samples_from_scenario(
             # duplicate this sample in the final dataset to force the model to pay attention.
             anchor_speed = float(np.linalg.norm(anchor_v))
             is_high_speed = anchor_speed >= float(high_speed_step_threshold)
-            is_near_edge = (map_feat[-1] > 0.0) and (map_feat[3] <= float(edge_near_threshold_m))
+            is_near_edge = (map_scalar[-1] > 0.0) and (map_scalar[3] <= float(edge_near_threshold_m))
             repeat_count = int(hard_case_duplication_factor) if (is_high_speed or is_near_edge) else 1
 
             for _ in range(repeat_count):
                 hist_list.append(hist_feat)
                 nbr_list.append(nbr_feat)
-                map_list.append(map_feat)
+                map_list.append(map_scalar)
+                map_scalar_list.append(map_scalar)
+                map_polyline_list.append(map_polyline)
+                map_point_valid_list.append(map_point_valid)
+                map_polyline_valid_list.append(map_polyline_valid)
+                map_signal_list.append(map_signal)
                 static_list.append(static_feat)
                 target_list.append(target)
                 hist_valid_list.append(hist_valid)
                 target_valid_list.append(target_valid)
                 nbr_valid_list.append(nbr_valid)
                 map_valid_list.append(map_valid)
+                map_polyline_mask_list.append(map_polyline_valid)
+                map_point_mask_list.append(map_point_valid)
                 meta_list.append(meta)
 
     if not hist_list:
         return _empty_sample_dict(H, F, K)
 
     return {
-        "hist": torch.from_numpy(np.stack(hist_list)).float(),
-        "nbr": torch.from_numpy(np.stack(nbr_list)).float(),
-        "map": torch.from_numpy(np.stack(map_list)).float(),
-        "static": torch.from_numpy(np.stack(static_list)).float(),
-        "target": torch.from_numpy(np.stack(target_list)).float(),
+        "hist": np.stack(hist_list).astype(np.float32),
+        "nbr": np.stack(nbr_list).astype(np.float32),
+        "map": np.stack(map_list).astype(np.float32),
+        "map_scalar": np.stack(map_scalar_list).astype(np.float32),
+        "map_polyline": np.stack(map_polyline_list).astype(np.float32),
+        "map_point_valid": np.stack(map_point_valid_list).astype(np.float32),
+        "map_polyline_valid": np.stack(map_polyline_valid_list).astype(np.float32),
+        "map_signal": np.stack(map_signal_list).astype(np.float32),
+        "static": np.stack(static_list).astype(np.float32),
+        "target": np.stack(target_list).astype(np.float32),
         "masks": {
-            "hist_valid": torch.from_numpy(np.stack(hist_valid_list)).float(),
-            "target_valid": torch.from_numpy(np.stack(target_valid_list)).float(),
-            "nbr_valid": torch.from_numpy(np.stack(nbr_valid_list)).float(),
-            "map_valid": torch.from_numpy(np.stack(map_valid_list)).float(),
+            "hist_valid": np.stack(hist_valid_list).astype(np.float32),
+            "target_valid": np.stack(target_valid_list).astype(np.float32),
+            "nbr_valid": np.stack(nbr_valid_list).astype(np.float32),
+            "map_valid": np.stack(map_valid_list).astype(np.float32),
+            "map_polyline_valid": np.stack(map_polyline_mask_list).astype(np.float32),
+            "map_point_valid": np.stack(map_point_mask_list).astype(np.float32),
         },
-        "meta": torch.from_numpy(np.stack(meta_list)).float(),
+        "meta": np.stack(meta_list).astype(np.float32),
+        "traffic_stats": map_cache.get("traffic_stats", {"total": 0, "matched": 0}),
     }
+
+def _worker_tf_init():
+    """Called once per spawned worker. Limits TF to 1 intra/inter thread so
+    NUM_WORKERS workers collectively use NUM_WORKERS cores rather than
+    NUM_WORKERS * 8 = over-subscribed thread storm."""
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+
 
 def _process_scenario_worker(args):
     (
@@ -576,20 +883,44 @@ def _append_to_buffer(buffer: dict, sample_dict: dict) -> int:
     if n == 0:
         return 0
 
-    for key in ["hist", "nbr", "map", "static", "target", "meta"]:
-        buffer[key].append(sample_dict[key])
-    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid"]:
-        buffer["masks"][key].append(sample_dict["masks"][key])
+    for key in [
+        "hist",
+        "nbr",
+        "map",
+        "map_scalar",
+        "map_polyline",
+        "map_point_valid",
+        "map_polyline_valid",
+        "map_signal",
+        "static",
+        "target",
+        "meta",
+    ]:
+        buffer[key].append(torch.from_numpy(sample_dict[key]))
+    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid", "map_polyline_valid", "map_point_valid"]:
+        buffer["masks"][key].append(torch.from_numpy(sample_dict["masks"][key]))
     return n
 
 def _flush_buffer(buffer: dict, out_dir: Path, shard_idx: int) -> tuple[str, int]:
     shard = {
         key: torch.cat(buffer[key], dim=0)
-        for key in ["hist", "nbr", "map", "static", "target", "meta"]
+        for key in [
+            "hist",
+            "nbr",
+            "map",
+            "map_scalar",
+            "map_polyline",
+            "map_point_valid",
+            "map_polyline_valid",
+            "map_signal",
+            "static",
+            "target",
+            "meta",
+        ]
     }
     shard["masks"] = {
         key: torch.cat(buffer["masks"][key], dim=0)
-        for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid"]
+        for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid", "map_polyline_valid", "map_point_valid"]
     }
 
     shard_path = out_dir / f"samples_{shard_idx:05d}.pt"
@@ -597,9 +928,21 @@ def _flush_buffer(buffer: dict, out_dir: Path, shard_idx: int) -> tuple[str, int
 
     n_written = int(shard["hist"].shape[0])
 
-    for key in ["hist", "nbr", "map", "static", "target", "meta"]:
+    for key in [
+        "hist",
+        "nbr",
+        "map",
+        "map_scalar",
+        "map_polyline",
+        "map_point_valid",
+        "map_polyline_valid",
+        "map_signal",
+        "static",
+        "target",
+        "meta",
+    ]:
         buffer[key].clear()
-    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid"]:
+    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid", "map_polyline_valid", "map_point_valid"]:
         buffer["masks"][key].clear()
 
     return str(shard_path), n_written
@@ -633,6 +976,11 @@ def write_sample_shards(
         "hist": [],
         "nbr": [],
         "map": [],
+        "map_scalar": [],
+        "map_polyline": [],
+        "map_point_valid": [],
+        "map_polyline_valid": [],
+        "map_signal": [],
         "static": [],
         "target": [],
         "meta": [],
@@ -641,6 +989,8 @@ def write_sample_shards(
             "target_valid": [],
             "nbr_valid": [],
             "map_valid": [],
+            "map_polyline_valid": [],
+            "map_point_valid": [],
         },
     }
 
@@ -651,114 +1001,101 @@ def write_sample_shards(
     total_samples = 0
     stopped_for_budget = False
     anchor_counts: dict[int, int] = {}
+    traffic_state_total = 0
+    traffic_state_matched = 0
 
     existing_bytes = directory_size_bytes(out_dir)
     if existing_bytes >= max_cache_bytes:
         print(f"{out_dir} already uses {bytes_to_gb(existing_bytes):.2f} GB, at or above budget {max_cache_gb:.2f} GB.")
         return sorted(str(path) for path in out_dir.glob("samples_*.pt"))
 
-    batch_size = num_workers * 2
-    scenario_batch = []
-    
-    print(f"Processing scenarios with {num_workers} parallel workers (batch size: {batch_size})")
-    first_sample_validated = False
-
-    with mp.Pool(num_workers) as pool:
+    def _args_gen():
+        """Lazily yields worker args from the streamer so imap_unordered never
+        pre-fetches more than ~2*num_workers scenarios into memory at once."""
         for bytes_example in streamer:
-            scenario_batch.append(bytes_example)
+            yield (
+                bytes_example,
+                H, F, K,
+                CURRENT_TIME_INDEX,
+                challenge_type_val,
+                anchor_stride,
+                min_future_valid,
+                multi_anchor,
+                high_speed_step_threshold,
+                edge_near_threshold_m,
+                hard_case_duplication_factor,
+            )
 
-            if len(scenario_batch) >= batch_size:
-                args_list = [
-                    (
-                        b,
-                        H,
-                        F,
-                        K,
-                        CURRENT_TIME_INDEX,
-                        challenge_type_val,
-                        anchor_stride,
-                        min_future_valid,
-                        multi_anchor,
-                        high_speed_step_threshold,
-                        edge_near_threshold_m,
-                        hard_case_duplication_factor,
-                    )
-                    for b in scenario_batch
-                ]
-                
-                results = pool.map(_process_scenario_worker, args_list)
+    print(f"Processing scenarios with {num_workers} parallel workers (CPU_COUNT={CPU_COUNT})")
+    print(f"Max scenarios: {max_scenarios}, Storage budget: {max_cache_gb:.1f} GB")
+    first_sample_validated = False
+    start_time = time.time()
 
-                for sample_dict in results:
-                    added = _append_to_buffer(buffer, sample_dict)
-                    buffered_samples += added
-                    total_samples += added
-                    if added > 0:
-                        anchor_vals = sample_dict["meta"][:, 2].to(torch.int64).tolist()
-                        for anchor_t in anchor_vals:
-                            anchor_t = int(anchor_t)
-                            anchor_counts[anchor_t] = anchor_counts.get(anchor_t, 0) + 1
-                    
-                    if not first_sample_validated and added > 0:
-                        print(f"\n=== First Sample Validation ===")
-                        print(f"hist shape: {sample_dict['hist'].shape}")
-                        print(f"target shape: {sample_dict['target'].shape}")
-                        print(f"=== Validation Complete ===\n")
-                        first_sample_validated = True
+    # maxtasksperchild recycles workers periodically to reclaim TF memory growth.
+    with mp.Pool(
+        num_workers,
+        initializer=_worker_tf_init,
+        maxtasksperchild=500,
+    ) as pool:
+        
+        last_print_seen = 0
 
-                scenarios_seen += len(scenario_batch)
-                scenario_batch.clear()
+        # imap_unordered keeps all workers busy: results are yielded as each
+        # worker finishes rather than waiting for a whole batch to complete.
+        # chunksize=1 ensures the generator is consumed lazily (no pre-fetching
+        # the entire dataset into the task queue).
+        for sample_dict in pool.imap_unordered(_process_scenario_worker, _args_gen(), chunksize=1):
+            tstats = sample_dict.get("traffic_stats", {"total": 0, "matched": 0})
+            traffic_state_total += int(tstats.get("total", 0))
+            traffic_state_matched += int(tstats.get("matched", 0))
+            added = _append_to_buffer(buffer, sample_dict)
+            buffered_samples += added
+            total_samples += added
+            scenarios_seen += 1
 
-                if buffered_samples >= shard_size and buffer["hist"]:
-                    shard_path, n_written = _flush_buffer(buffer, out_dir, shard_idx)
-                    shard_paths.append(shard_path)
-                    shard_idx += 1
-                    buffered_samples = 0
+            if scenarios_seen - last_print_seen >= PROGRESS_PRINT_EVERY or scenarios_seen == max_scenarios:
+                elapsed = max(1e-6, time.time() - start_time)
+                scen_per_sec = scenarios_seen / elapsed
+                print(
+                    f"Processed {scenarios_seen}/{max_scenarios} scenarios "
+                    f"(samples={total_samples}, rate={scen_per_sec:.2f} scen/s)"
+                )
+                last_print_seen = scenarios_seen
 
-                    current_bytes = directory_size_bytes(out_dir)
-                    print(
-                        f"Wrote shard {shard_idx} with {n_written} samples "
-                        f"(scenarios: {scenarios_seen}, cache size: {bytes_to_gb(current_bytes):.2f} GB / {max_cache_gb:.2f} GB)"
-                    )
-                    if current_bytes >= max_cache_bytes:
-                        stopped_for_budget = True
-                        print(f"Stopping {out_dir.name} split because cache budget was reached.")
-                        break
+            if added > 0:
+                anchor_src = sample_dict["meta"][:, 2]
+                if isinstance(anchor_src, torch.Tensor):
+                    anchor_vals = anchor_src.to(torch.int64).tolist()
+                else:
+                    anchor_vals = np.asarray(anchor_src, dtype=np.int64).tolist()
+                for anchor_t in anchor_vals:
+                    anchor_counts[int(anchor_t)] = anchor_counts.get(int(anchor_t), 0) + 1
+
+            if not first_sample_validated and added > 0:
+                print(f"\n=== First Sample Validation ===")
+                print(f"hist shape: {sample_dict['hist'].shape}")
+                print(f"map_polyline shape: {sample_dict['map_polyline'].shape}")
+                print(f"target shape: {sample_dict['target'].shape}")
+                print(f"=== Validation Complete ===\n")
+                first_sample_validated = True
+
+            if buffered_samples >= shard_size and buffer["hist"]:
+                shard_path, n_written = _flush_buffer(buffer, out_dir, shard_idx)
+                shard_paths.append(shard_path)
+                shard_idx += 1
+                buffered_samples = 0
+                current_bytes = directory_size_bytes(out_dir)
+                print(
+                    f"Wrote shard {shard_idx} with {n_written} samples "
+                    f"(scenarios: {scenarios_seen}, cache size: {bytes_to_gb(current_bytes):.2f} GB / {max_cache_gb:.2f} GB)"
+                )
+                if current_bytes >= max_cache_bytes:
+                    stopped_for_budget = True
+                    print(f"Stopping {out_dir.name} split because cache budget was reached.")
+                    break
 
             if scenarios_seen >= max_scenarios:
                 break
-
-        if scenario_batch and not stopped_for_budget:
-            args_list = [
-                (
-                    b,
-                    H,
-                    F,
-                    K,
-                    CURRENT_TIME_INDEX,
-                    challenge_type_val,
-                    anchor_stride,
-                    min_future_valid,
-                    multi_anchor,
-                    high_speed_step_threshold,
-                    edge_near_threshold_m,
-                    hard_case_duplication_factor,
-                )
-                for b in scenario_batch
-            ]
-            results = pool.map(_process_scenario_worker, args_list)
-
-            for sample_dict in results:
-                added = _append_to_buffer(buffer, sample_dict)
-                buffered_samples += added
-                total_samples += added
-                if added > 0:
-                    anchor_vals = sample_dict["meta"][:, 2].to(torch.int64).tolist()
-                    for anchor_t in anchor_vals:
-                        anchor_t = int(anchor_t)
-                        anchor_counts[anchor_t] = anchor_counts.get(anchor_t, 0) + 1
-
-            scenarios_seen += len(scenario_batch)
-            scenario_batch.clear()
 
     if buffer["hist"] and not stopped_for_budget:
         shard_path, n_written = _flush_buffer(buffer, out_dir, shard_idx)
@@ -770,18 +1107,27 @@ def write_sample_shards(
         )
 
     manifest = {
+        "schema_version": MAP_SCHEMA_VERSION,
         "max_scenarios": max_scenarios,
         "scenarios_seen": scenarios_seen,
         "total_samples": total_samples,
         "H": H,
         "F": F,
         "K": K,
+        "neighbors_k": K,
+        "point_stride": MAP_POINT_STRIDE,
+        "polyline_points": MAP_POLYLINE_POINTS,
+        "polyline_overlap": MAP_POLYLINE_OVERLAP,
+        "polyline_budget": MAP_POLYLINE_BUDGET,
         "anchor_stride": anchor_stride,
         "min_future_valid": min_future_valid,
         "multi_anchor": bool(multi_anchor),
         "high_speed_step_threshold": float(high_speed_step_threshold),
         "edge_near_threshold_m": float(edge_near_threshold_m),
         "hard_case_duplication_factor": int(hard_case_duplication_factor),
+        "traffic_light_state_total": int(traffic_state_total),
+        "traffic_light_state_matched": int(traffic_state_matched),
+        "traffic_lane_match_rate": float(traffic_state_matched / max(1, traffic_state_total)),
         "anchor_counts": anchor_counts,
         "shards": sorted(str(path) for path in out_dir.glob("samples_*.pt")),
         "cache_size_gb": bytes_to_gb(directory_size_bytes(out_dir)),
@@ -806,13 +1152,32 @@ def validate_cache_split(cache_dir: Path, expected_h: int, expected_f: int, expe
     assert int(shard["hist"].shape[1]) == expected_h
     assert int(shard["target"].shape[1]) == expected_f
     assert int(shard["nbr"].shape[1]) == expected_k
-    for key in ["hist", "nbr", "map", "static", "target", "meta"]:
+    assert int(shard["map_polyline"].shape[1]) == MAP_POLYLINE_BUDGET
+    assert int(shard["map_polyline"].shape[2]) == MAP_POLYLINE_POINTS
+    assert int(shard["map_polyline"].shape[3]) == MAP_POINT_DIM
+    assert int(shard["map_signal"].shape[2]) == MAP_SIGNAL_DIM
+    for key in [
+        "hist",
+        "nbr",
+        "map",
+        "map_scalar",
+        "map_polyline",
+        "map_point_valid",
+        "map_polyline_valid",
+        "map_signal",
+        "static",
+        "target",
+        "meta",
+    ]:
         assert torch.isfinite(shard[key]).all(), f"Non-finite values found in {cache_dir}/{key}"
-    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid"]:
+    for key in ["hist_valid", "target_valid", "nbr_valid", "map_valid", "map_polyline_valid", "map_point_valid"]:
         assert torch.isfinite(shard["masks"][key]).all(), f"Non-finite mask values found in {cache_dir}/{key}"
 
     manifest_path = cache_dir / "manifest.pt"
     manifest = torch.load(manifest_path, map_location="cpu", weights_only=False)
+    assert str(manifest.get("schema_version", "")) == MAP_SCHEMA_VERSION, (
+        f"Expected schema_version={MAP_SCHEMA_VERSION} in {manifest_path}, got {manifest.get('schema_version')}"
+    )
     anchor_counts = manifest.get("anchor_counts", {})
     if bool(manifest.get("multi_anchor", False)):
         expected_anchors = list(range(ANCHOR_MIN_T, ANCHOR_MAX_T + 1, manifest.get("anchor_stride", ANCHOR_STRIDE)))
@@ -837,7 +1202,10 @@ if __name__ == "__main__":
     if REBUILD_EXISTING_CACHE:
         for cache_dir in [TRAIN_CACHE_DIR, VAL_CACHE_DIR]:
             if cache_dir.exists():
+                t0 = time.time()
+                print(f"Removing existing cache dir: {cache_dir}")
                 shutil.rmtree(cache_dir)
+                print(f"Removed {cache_dir} in {time.time() - t0:.1f}s")
             cache_dir.mkdir(parents=True, exist_ok=True)
         print("Existing cache directories removed and recreated.")
     
