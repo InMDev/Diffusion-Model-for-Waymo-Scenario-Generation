@@ -80,3 +80,10 @@ python download.py
 2. Run exploratory analysis:  Open and run `EDA.ipynb`
 3. Train model and export checkpoint: Open and run `train.ipynb`
 4. Run inference + generate report figures: Open and run `inference.ipynb`
+
+## Acknowledgements
+- Dataset: Thanks to [Waymo](https://waymo.com/open/data/motion) for releasing the Waymo Open Motion Dataset.
+- Research Code: This project is inspired mainly by:
+  - [DDPM Original Code](https://github.com/hojonathanho/diffusion)
+  - [Classifier-free tutorial](https://github.com/tsmatz/diffusion-tutorials/blob/master/07-classifier-free-guidance.ipynb)
+  - [Waymo Random Policy Scenario Generation](https://github.com/waymo-research/waymo-open-dataset/blob/master/tutorial/tutorial_scenario_gen.ipynb)
